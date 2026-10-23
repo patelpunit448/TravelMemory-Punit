@@ -1,0 +1,155 @@
+---
+# roles/database/tasks/main.yml
+# Ubuntu 24 + apt
+
+# ── 1. System update ───────────────────────────────────────────────────────
+- name: Update apt cache
+  ansible.builtin.apt:
+    update_cache: true
+
+- name: Install required packages
+  ansible.builtin.apt:
+    name:
+      - gnupg
+      - curl
+      - python3-pymongo
+    state: present
+
+# ── 2. Add MongoDB 7.0 repository ─────────────────────────────────────────
+- name: Add MongoDB GPG key
+  ansible.builtin.shell:
+    cmd: curl -fsSL https://www.mongodb.org/static/pgp/server-7.0.asc | gpg --dearmor -o /usr/share/keyrings/mongodb-server-7.0.gpg
+    creates: /usr/share/keyrings/mongodb-server-7.0.gpg
+  changed_when: false
+
+- name: Add MongoDB apt repository
+  ansible.builtin.copy:
+    dest: /etc/apt/sources.list.d/mongodb-org-7.0.list
+    content: |
+      deb [ arch=amd64,arm64 signed-by=/usr/share/keyrings/mongodb-server-7.0.gpg ] https://repo.mongodb.org/apt/ubuntu jammy/mongodb-org/7.0 multiverse
+    mode: "0644"
+
+- name: Update apt cache after adding MongoDB repo
+  ansible.builtin.apt:
+    update_cache: true
+
+# ── 3. Install MongoDB ─────────────────────────────────────────────────────
+- name: Install MongoDB
+  ansible.builtin.apt:
+    name: mongodb-org
+    state: present
+
+# ── 4. Disable auth for initial user setup ────────────────────────────────
+- name: Disable MongoDB auth for initial setup
+  ansible.builtin.lineinfile:
+    path: /etc/mongod.conf
+    regexp: "^security:"
+    line: "#security:"
+
+- name: Comment out authorization line
+  ansible.builtin.lineinfile:
+    path: /etc/mongod.conf
+    regexp: ".*authorization:.*"
+    line: "#  authorization: disabled"
+
+# ── 5. Configure MongoDB bindIp ────────────────────────────────────────────
+- name: Configure MongoDB bindIp
+  ansible.builtin.lineinfile:
+    path: /etc/mongod.conf
+    regexp: "^  bindIp:"
+    line: "  bindIp: 127.0.0.1,{{ ansible_facts['default_ipv4']['address'] }}"
+
+# ── 6. Start MongoDB without auth ─────────────────────────────────────────
+- name: Enable and start MongoDB
+  ansible.builtin.systemd:
+    name: mongod
+    enabled: true
+    state: restarted
+
+- name: Wait for MongoDB to be ready
+  ansible.builtin.wait_for:
+    port: 27017
+    host: 127.0.0.1
+    timeout: 30
+
+# ── 7. Create admin user ───────────────────────────────────────────────────
+- name: Drop and recreate admin user
+  ansible.builtin.shell: |
+    mongosh admin --quiet --eval '
+      try { db.dropUser("admin") } catch(e) {}
+      db.createUser({
+        user: "admin",
+        pwd: "{{ mongo_admin_password }}",
+        roles: [{ role: "root", db: "admin" }]
+      })
+    '
+  changed_when: true
+
+# ── 8. Create application user ─────────────────────────────────────────────
+- name: Drop and recreate application user
+  ansible.builtin.shell: |
+    mongosh {{ mongo_db_name }} --quiet --eval '
+      try { db.dropUser("{{ mongo_app_user }}") } catch(e) {}
+      db.createUser({
+        user: "{{ mongo_app_user }}",
+        pwd: "{{ mongo_app_password }}",
+        roles: [{ role: "readWrite", db: "{{ mongo_db_name }}" }]
+      })
+    '
+  changed_when: true
+
+# ── 9. Enable authentication ───────────────────────────────────────────────
+- name: Enable MongoDB authentication
+  ansible.builtin.blockinfile:
+    path: /etc/mongod.conf
+    block: |
+      security:
+        authorization: enabled
+    marker: "# {mark} ANSIBLE MANAGED SECURITY BLOCK"
+
+- name: Restart MongoDB with auth enabled
+  ansible.builtin.systemd:
+    name: mongod
+    state: restarted
+
+- name: Wait for MongoDB with auth to be ready
+  ansible.builtin.wait_for:
+    port: 27017
+    host: 127.0.0.1
+    timeout: 30
+
+# ── 10. Verify authentication works ───────────────────────────────────────
+- name: Verify app user can authenticate
+  ansible.builtin.shell: |
+    mongosh "mongodb://{{ mongo_app_user }}:{{ mongo_app_password }}@127.0.0.1:27017/{{ mongo_db_name }}" \
+    --quiet --eval 'db.runCommand({connectionStatus: 1})'
+  register: database_auth_verify
+  changed_when: false
+  failed_when: "'ok: 1' not in database_auth_verify.stdout"
+
+# ── 11. Fix data directory permissions ─────────────────────────────────────
+- name: Ensure MongoDB data directory permissions
+  ansible.builtin.file:
+    path: /var/lib/mongodb
+    owner: mongodb
+    group: mongodb
+    mode: "0750"
+    state: directory
+
+# ── 12. Security hardening ─────────────────────────────────────────────────
+- name: Disable root SSH login
+  ansible.builtin.lineinfile:
+    path: /etc/ssh/sshd_config
+    regexp: "^PermitRootLogin"
+    line: "PermitRootLogin no"
+
+- name: Disable password authentication
+  ansible.builtin.lineinfile:
+    path: /etc/ssh/sshd_config
+    regexp: "^PasswordAuthentication"
+    line: "PasswordAuthentication no"
+
+- name: Restart SSH
+  ansible.builtin.systemd:
+    name: ssh
+    state: restarted
